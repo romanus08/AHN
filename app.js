@@ -2,15 +2,14 @@
  * ==========================================
  * AETHER ART HALL - CORE RESERVATION ENGINE
  * ==========================================
- * 
- * [교육용 안내]
- * 이 스크립트는 싱글 페이지 애플리케이션(SPA) 형태로 동작하는 연극 예매 시스템의 핵심 로직입니다.
- * 외부 데이터베이스(Supabase) 대신 브라우저의 'localStorage'를 활용해 데이터의 영속성을 시뮬레이션합니다.
- * 주요 학습 포인트:
- *   1. State-driven UI: 데이터(상태)를 변경하면 UI가 실시간으로 대응하여 갱신됩니다.
- *   2. Event Delegation: 동적으로 생성된 요소에 효율적으로 이벤트를 바인딩합니다.
- *   3. LocalStorage CRUD: 데이터의 조회, 추가를 로컬 파일처럼 다룹니다.
  */
+
+import { createClient } from '@supabase/supabase-js';
+
+// Supabase 클라이언트 초기화
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // 1. 애플리케이션 상태 (Global State)
 const state = {
@@ -18,7 +17,8 @@ const state = {
     selectedPerformance: null,   // 선택된 연극 공연 객체
     selectedDate: '',            // 선택된 날짜 (YYYY-MM-DD 형식)
     selectedTime: '',            // 선택된 시간 (HH:MM 형식)
-    selectedSeats: []            // 현재 사용자가 클릭하여 선택한 좌석 번호 목록 (예: ['C-5', 'D-6'])
+    selectedSeats: [],           // 현재 사용자가 클릭하여 선택한 좌석 번호 목록 (예: ['C-5', 'D-6'])
+    bookedTickets: []            // 선택된 공연 및 날짜의 예매 목록 캐시
 };
 
 // 2. 대학로 대표 연극 모의 데이터 (Mock Data)
@@ -94,8 +94,32 @@ const DOM = {
 };
 
 // 4. 초기화 함수
-function init() {
-    state.performances = mockPerformances;
+async function init() {
+    try {
+        // Supabase에서 실시간 공연 정보 로드
+        const { data, error } = await supabase
+            .from('performances')
+            .select('*')
+            .order('id', { ascending: true });
+
+        if (error) throw error;
+
+        // DB 데이터를 기존 mock 구조에 매핑
+        state.performances = data.map(p => ({
+            id: p.id,
+            title: p.title,
+            englishTitle: p.english_title,
+            genre: p.genre,
+            runtime: p.runtime,
+            rating: Number(p.rating),
+            vipRows: p.vip_rows,
+            desc: p.description,
+            gradient: p.gradient
+        }));
+    } catch (error) {
+        console.error('Supabase 연동 실패. 로컬 Mock 데이터를 사용합니다.', error);
+        state.performances = mockPerformances;
+    }
     
     // 4-1. 연극 목록 카드 렌더링
     renderPerformances();
@@ -168,6 +192,7 @@ function selectPerformance(play) {
     state.selectedDate = '';
     state.selectedTime = '';
     state.selectedSeats = [];
+    state.bookedTickets = []; // 캐시 초기화
     
     // 다음 섹션 표시 및 초기 렌더링
     DOM.scheduleSection.classList.remove('hidden');
@@ -209,12 +234,29 @@ function renderDates() {
             <span class="date-day-num">${dateVal}</span>
         `;
         
-        dateCard.addEventListener('click', () => {
+        dateCard.addEventListener('click', async () => {
             state.selectedDate = fullDateStr;
             
             // UI 업데이트
             document.querySelectorAll('.date-card').forEach(c => c.classList.remove('selected'));
             dateCard.classList.add('selected');
+
+            DOM.timeGrid.innerHTML = '<div style="color: var(--text-muted); font-size: 0.9rem; grid-column: 1/-1; text-align: center; padding: 20px;">예약 현황을 불러오는 중...</div>';
+            
+            try {
+                // Supabase에서 해당 연극 및 날짜의 예매 목록을 비동기로 로드하여 캐싱
+                const { data, error } = await supabase
+                    .from('tickets')
+                    .select('*')
+                    .eq('performance_id', state.selectedPerformance.id)
+                    .eq('date', state.selectedDate);
+
+                if (error) throw error;
+                state.bookedTickets = data || [];
+            } catch (error) {
+                console.error('Supabase 예약 현황 조회 실패. LocalStorage 백업을 사용합니다.', error);
+                state.bookedTickets = [];
+            }
             
             // 시간대 렌더링 활성화
             renderTimes();
@@ -405,21 +447,31 @@ function updateSummary() {
     DOM.btnCheckout.disabled = state.selectedSeats.length === 0;
 }
 
-// 12. [Local DB] 특정 상영 시간표에 예약 완료된 좌석 추출 헬퍼
+// 12. 특정 상영 시간표에 예약 완료된 좌석 추출 (로컬 캐시 및 LocalStorage 백업 기반)
 function getBookedSeatsForShow(movieId, date, time) {
-    const tickets = getAllTickets();
     const bookedSeats = [];
     
-    tickets.forEach(ticket => {
-        if (ticket.movieId === movieId && ticket.date === date && ticket.time === time) {
-            bookedSeats.push(...ticket.seats);
-        }
-    });
+    if (state.bookedTickets && state.bookedTickets.length > 0) {
+        state.bookedTickets.forEach(ticket => {
+            // PostgreSQL time 형식은 '20:00:00' 형태이므로 초(seconds)를 제외하고 비교
+            const ticketTime = ticket.time.substring(0, 5);
+            if (ticket.performance_id === movieId && ticket.date === date && ticketTime === time) {
+                bookedSeats.push(...ticket.seats);
+            }
+        });
+    } else {
+        const localTickets = getAllTickets();
+        localTickets.forEach(ticket => {
+            if (ticket.movieId === movieId && ticket.date === date && ticket.time === time) {
+                bookedSeats.push(...ticket.seats);
+            }
+        });
+    }
     
     return bookedSeats;
 }
 
-// 13. [Local DB] 전체 티켓 로드 및 저장 함수
+// 13. [Local DB] 전체 티켓 로드 및 저장 함수 (Fallback 용)
 function getAllTickets() {
     const data = localStorage.getItem('aether_cinema_tickets');
     return data ? JSON.parse(data) : [];
@@ -429,37 +481,69 @@ function saveTickets(ticketsArray) {
     localStorage.setItem('aether_cinema_tickets', JSON.stringify(ticketsArray));
 }
 
-// 14. 가상 무료 예매 완료 실행 (Checkout)
-function handleCheckout() {
+// 14. 무료 예매 완료 실행 (Checkout)
+async function handleCheckout() {
     if (state.selectedSeats.length === 0) return;
 
-    // 가상 티켓 데이터 구조 생성 (금액 제외)
+    DOM.btnCheckout.disabled = true;
+    DOM.btnCheckout.innerHTML = '<i data-lucide="loader" class="animate-spin"></i> 예매 처리 중...';
+    if (window.lucide) window.lucide.createIcons();
+
     const ticketId = 'AC-' + Math.random().toString(36).substr(2, 9).toUpperCase();
-    const newTicket = {
-        id: ticketId,
-        movieId: state.selectedPerformance.id,
-        movieTitle: state.selectedPerformance.title,
-        date: state.selectedDate,
-        time: state.selectedTime,
-        seats: [...state.selectedSeats],
-        bookedAt: new Date().toLocaleString()
-    };
 
-    // 로컬 스토리지에 티켓 푸시 (좌석 비활성화 영속성을 유지하기 위해 데이터 저장)
-    const currentTickets = getAllTickets();
-    currentTickets.push(newTicket);
-    saveTickets(currentTickets);
+    try {
+        // Supabase에 예약 데이터 삽입
+        const { error } = await supabase
+            .from('tickets')
+            .insert([{
+                id: ticketId,
+                performance_id: state.selectedPerformance.id,
+                date: state.selectedDate,
+                time: state.selectedTime,
+                seats: [...state.selectedSeats]
+            }]);
 
-    // 성공 메시지 피드백
-    alert(`🎉 무료 예매가 성공적으로 완료되었습니다!\n예매번호: ${ticketId}\n선택하신 좌석: ${state.selectedSeats.map(s=>s.replace('-','')).join(', ')}`);
+        if (error) throw error;
 
-    // 입력 상태 리셋 및 좌석 맵 상태 갱신
-    state.selectedSeats = [];
-    
-    // UI 동기화
-    renderSeatLayout();
-    updateSummary();
-    renderTimes(); // 남은 좌석수 업데이트
+        // 성공적으로 DB 저장 완료 시 로컬 캐시 동기화
+        state.bookedTickets.push({
+            id: ticketId,
+            performance_id: state.selectedPerformance.id,
+            date: state.selectedDate,
+            time: state.selectedTime + ':00',
+            seats: [...state.selectedSeats],
+            booked_at: new Date().toISOString()
+        });
+
+        alert(`🎉 무료 예매가 성공적으로 완료되었습니다!\n예매번호: ${ticketId}\n선택하신 좌석: ${state.selectedSeats.map(s=>s.replace('-','')).join(', ')}`);
+        
+    } catch (error) {
+        console.error('Supabase 예약 등록 실패. LocalStorage 백업 저장소를 활용합니다.', error);
+        
+        // 네트워크 에러 시 로컬 스토리지 대체 작동
+        const newTicket = {
+            id: ticketId,
+            movieId: state.selectedPerformance.id,
+            movieTitle: state.selectedPerformance.title,
+            date: state.selectedDate,
+            time: state.selectedTime,
+            seats: [...state.selectedSeats],
+            bookedAt: new Date().toLocaleString()
+        };
+        const currentTickets = getAllTickets();
+        currentTickets.push(newTicket);
+        saveTickets(currentTickets);
+        
+        alert(`🎉 [로컬 백업 저장] 네트워크 연결 상태가 좋지 않아 로컬 저장소에 임시 예매되었습니다.\n예매번호: ${ticketId}\n선택하신 좌석: ${state.selectedSeats.map(s=>s.replace('-','')).join(', ')}`);
+    } finally {
+        DOM.btnCheckout.innerHTML = '<i data-lucide="check-circle"></i> 무료 예매 완료';
+        if (window.lucide) window.lucide.createIcons();
+
+        state.selectedSeats = [];
+        renderSeatLayout();
+        updateSummary();
+        renderTimes();
+    }
 }
 
 // 15. 이벤트 리스너 통합 등록부

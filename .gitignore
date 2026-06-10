@@ -1,3 +1,10 @@
 node_modules/
 dist/
 .DS_Store
+
+# Local Env Files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
